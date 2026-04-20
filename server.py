@@ -41,6 +41,8 @@ class UDPFileServer:
             
             if command == 'list_dir':
                 response = self.list_directory(request.get('path', '.'))
+            elif command == 'get_drives':
+                response = self.get_drives()
             elif command == 'get_file':
                 response = self.get_file(request.get('path'), addr)
                 self.send_response(response, addr)
@@ -213,6 +215,40 @@ class UDPFileServer:
                 'created': datetime.fromtimestamp(stat.st_ctime).isoformat(),
                 'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 'permissions': oct(stat.st_mode)[-3:]
+            }
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+    
+    def get_drives(self):
+        """Получение списка доступных дисков/разделов"""
+        try:
+            import os
+            drives = []
+            
+            # Для Windows - список букв дисков
+            if os.name == 'nt':
+                import string
+                for letter in string.ascii_uppercase:
+                    drive = f"{letter}:\\"
+                    if os.path.exists(drive):
+                        drives.append(drive)
+            else:
+                # Для Linux/Unix - монтированные разделы
+                try:
+                    with open('/proc/mounts', 'r') as f:
+                        for line in f:
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                mount_point = parts[1]
+                                if mount_point.startswith('/') and os.path.isdir(mount_point):
+                                    drives.append(mount_point)
+                except:
+                    # Fallback для Unix
+                    drives = ['/', '/home', '/mnt', '/media']
+            
+            return {
+                'status': 'ok',
+                'drives': drives
             }
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
