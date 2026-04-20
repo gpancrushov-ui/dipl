@@ -515,7 +515,8 @@ class FileManagerApp:
         self.root.bind('<F7>', lambda e: self.create_directory())
         self.root.bind('<F8>', lambda e: self.delete_file())
         self.root.bind('<F2>', lambda e: self.rename_file())
-        self.root.bind('<Control+r>', lambda e: self.refresh_all())
+        self.root.bind('<Control-R>', lambda e: self.refresh_all())
+        self.root.bind('<Control-r>', lambda e: self.refresh_all())
         
     def setup_status_bar(self):
         """Setup status bar"""

@@ -39,12 +39,18 @@ class UDPFileClient:
         
     def send_request(self, request):
         """Отправка запроса на сервер"""
-        data = json.dumps(request).encode('utf-8')
-        self.socket.sendto(data, (self.server_host, self.server_port))
+        try:
+            data = json.dumps(request).encode('utf-8')
+            self.socket.sendto(data, (self.server_host, self.server_port))
+            return True
+        except Exception as e:
+            self.status_message = f"Ошибка отправки: {e}"
+            return False
         
-    def receive_response(self):
+    def receive_response(self, timeout=5.0):
         """Получение ответа от сервера"""
         chunks = []
+        self.socket.settimeout(timeout)
         while True:
             try:
                 data, _ = self.socket.recvfrom(4096)
@@ -122,6 +128,44 @@ class UDPFileClient:
         except Exception as e:
             self.status_message = f"Ошибка: {str(e)}"
             return False
+    
+    def get_remote_drives(self):
+        """Запрос списка дисков с сервера"""
+        self.send_request({'command': 'get_drives'})
+        response = self.receive_response()
+        
+        if response.get('status') == 'ok':
+            return response.get('drives', [])
+        else:
+            self.status_message = f"Ошибка получения дисков: {response.get('message', '')}"
+            return []
+    
+    def get_local_drives(self):
+        """Получение списка локальных дисков"""
+        import os
+        drives = []
+        
+        # Для Windows
+        if os.name == 'nt':
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    drives.append(drive)
+        else:
+            # Для Linux/Unix
+            try:
+                with open('/proc/mounts', 'r') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            mount_point = parts[1]
+                            if mount_point.startswith('/') and os.path.isdir(mount_point):
+                                drives.append(mount_point)
+            except:
+                drives = ['/', '/home', '/mnt', '/media']
+        
+        return drives
     
     def get_remote_file(self, remote_path, local_path):
         """Скачивание файла с сервера"""
