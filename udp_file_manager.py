@@ -17,6 +17,7 @@ import os
 import json
 import threading
 import struct
+import time
 from pathlib import Path
 import hashlib
 
@@ -388,10 +389,11 @@ class FileManagerApp:
         self.remote_server = None
         self.remote_client = UDPClient()
         self.active_panel = 'local'  # 'local' or 'remote'
+        self.sort_mode = 'name'  # 'name', 'size', 'date', 'type'
+        self.sort_reverse = False
         
         # Setup UI
         self.setup_menu()
-        self.setup_toolbar()
         self.setup_main_area()
         self.setup_status_bar()
         
@@ -417,49 +419,163 @@ class FileManagerApp:
         net_menu.add_command(label="Scan for Servers...", command=self.scan_servers)
         net_menu.add_command(label="Manual Connect...", command=self.manual_connect)
         
+        # View menu - Sorting
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        sort_submenu = tk.Menu(view_menu, tearoff=0)
+        view_menu.add_cascade(label="Sort by", menu=sort_submenu)
+        sort_submenu.add_radiobutton(label="Name", command=lambda: self.set_sort_mode('name'))
+        sort_submenu.add_radiobutton(label="Size", command=lambda: self.set_sort_mode('size'))
+        sort_submenu.add_radiobutton(label="Date", command=lambda: self.set_sort_mode('date'))
+        sort_submenu.add_radiobutton(label="Type", command=lambda: self.set_sort_mode('type'))
+        view_menu.add_separator()
+        view_menu.add_command(label="Toggle Sort Order", command=self.toggle_sort_order)
+        
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
         help_menu.add_command(label="About", command=self.show_about)
         
-    def setup_toolbar(self):
-        """Setup toolbar with drive selectors"""
-        toolbar = tk.Frame(self.root, bg='#f0f0f0')
-        toolbar.pack(fill=tk.X, padx=5, pady=5)
+    def setup_action_buttons(self):
+        """Setup action buttons at the bottom"""
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Local drive selector
-        tk.Label(toolbar, text="Local:", bg='#f0f0f0').pack(side=tk.LEFT, padx=5)
-        self.local_drive_var = tk.StringVar()
-        self.local_drive_combo = ttk.Combobox(toolbar, textvariable=self.local_drive_var, width=15, state='readonly')
-        self.local_drive_combo.pack(side=tk.LEFT, padx=5)
-        self.local_drive_combo.bind('<<ComboboxSelected>>', self.on_local_drive_change)
+        # Copy from remote to local button
+        tk.Button(btn_frame, text="⬇ Download Selected", command=self.download_selected, bg='#90EE90').pack(side=tk.LEFT, padx=5)
         
-        # Refresh button for local
-        tk.Button(toolbar, text="⟳", width=3, command=self.refresh_local_panel).pack(side=tk.LEFT, padx=2)
+        # Copy from local to remote button
+        tk.Button(btn_frame, text="⬆ Upload Selected", command=self.upload_selected, bg='#87CEEB').pack(side=tk.LEFT, padx=5)
         
-        # Spacer
-        tk.Frame(toolbar, width=20).pack(side=tk.LEFT)
+        # Scan button
+        tk.Button(btn_frame, text="🔍 Scan UDP Servers", command=self.scan_servers, bg='#FFD700').pack(side=tk.RIGHT, padx=5)
         
-        # Remote drive selector
-        tk.Label(toolbar, text="Remote:", bg='#f0f0f0').pack(side=tk.LEFT, padx=5)
-        self.remote_drive_var = tk.StringVar()
-        self.remote_drive_combo = ttk.Combobox(toolbar, textvariable=self.remote_drive_var, width=15, state='readonly')
-        self.remote_drive_combo.pack(side=tk.LEFT, padx=5)
-        self.remote_drive_combo.bind('<<ComboboxSelected>>', self.on_remote_drive_change)
-        
-        # Refresh button for remote
-        tk.Button(toolbar, text="⟳", width=3, command=self.refresh_remote_panel).pack(side=tk.LEFT, padx=2)
-        
-        # Connection status
-        self.connection_label = tk.Label(toolbar, text="Disconnected", bg='#f0f0f0', fg='red')
+        # Connection status label
+        self.connection_label = tk.Label(btn_frame, text="Disconnected", fg='red')
         self.connection_label.pack(side=tk.RIGHT, padx=10)
         
-        # Populate local drives
-        self.populate_local_drives()
+    def download_selected(self):
+        """Download selected file from remote to local"""
+        selection = self.remote_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "No file selected")
+            return
+            
+        item = selection[0]
+        name = self.remote_tree.item(item, 'text')
+        ftype = self.remote_tree.item(item, 'values')[1]
+        
+        if ftype == 'DIR':
+            messagebox.showwarning("Warning", "Directory download not supported yet")
+            return
+            
+        src_path = os.path.join(self.remote_path, name)
+        dst_path = os.path.join(self.local_path, name)
+        
+        if self.remote_client.download_file(src_path, dst_path):
+            self.refresh_local_panel()
+            self.status_bar.config(text=f"Downloaded {name} from remote")
+        else:
+            messagebox.showerror("Error", "Failed to download file")
+            
+    def upload_selected(self):
+        """Upload selected file from local to remote"""
+        selection = self.local_tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "No file selected")
+            return
+            
+        item = selection[0]
+        name = self.local_tree.item(item, 'text')
+        ftype = self.local_tree.item(item, 'values')[1]
+        
+        if ftype == 'DIR':
+            messagebox.showwarning("Warning", "Directory upload not supported yet")
+            return
+            
+        src_path = os.path.join(self.local_path, name)
+        dst_path = os.path.join(self.remote_path, name)
+        
+        if self.remote_client.upload_file(src_path, dst_path):
+            self.refresh_remote_panel()
+            self.status_bar.config(text=f"Uploaded {name} to remote")
+        else:
+            messagebox.showerror("Error", "Failed to upload file")
+
+    def set_sort_mode(self, mode):
+        """Set sort mode"""
+        self.sort_mode = mode
+        self.refresh_local_panel()
+        if self.remote_client.sock:
+            self.refresh_remote_panel()
+            
+    def toggle_sort_order(self):
+        """Toggle sort order"""
+        self.sort_reverse = not self.sort_reverse
+        self.refresh_local_panel()
+        if self.remote_client.sock:
+            self.refresh_remote_panel()
+            
+    def toggle_sort(self, column):
+        """Toggle sort for local panel"""
+        if self.sort_mode == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_mode = column
+            self.sort_reverse = False
+        self.refresh_local_panel()
+        
+    def toggle_sort_remote(self, column):
+        """Toggle sort for remote panel"""
+        if self.sort_mode == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_mode = column
+            self.sort_reverse = False
+        if self.remote_client.sock:
+            self.refresh_remote_panel()
+            
+    def sort_entries(self, entries, is_local=True):
+        """Sort entries based on current sort mode"""
+        def get_sort_key(entry):
+            if is_local:
+                name = entry
+                full_path = os.path.join(self.local_path, name)
+                is_dir = os.path.isdir(full_path)
+                if self.sort_mode == 'size':
+                    return (0 if is_dir else os.path.getsize(full_path), name)
+                elif self.sort_mode == 'date':
+                    return (0 if is_dir else os.path.getmtime(full_path), name)
+                elif self.sort_mode == 'type':
+                    ext = os.path.splitext(name)[1].lower()
+                    return (0 if is_dir else ext, name)
+                else:  # name
+                    return (0 if is_dir else 1, name.lower())
+            else:
+                # Remote entry format: name|type|size
+                parts = entry.split('|')
+                name = parts[0]
+                ftype = parts[1] if len(parts) > 1 else 'file'
+                size = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                is_dir = ftype == 'dir'
+                
+                if self.sort_mode == 'size':
+                    return (0 if is_dir else size, name)
+                elif self.sort_mode == 'date':
+                    # Date not available from server, use name as fallback
+                    return (0 if is_dir else 0, name)
+                elif self.sort_mode == 'type':
+                    ext = os.path.splitext(name)[1].lower()
+                    return (0 if is_dir else ext, name)
+                else:  # name
+                    return (0 if is_dir else 1, name.lower())
+        
+        return sorted(entries, key=get_sort_key, reverse=self.sort_reverse)
         
     def setup_main_area(self):
         """Setup main area with two panels"""
+        # Main container
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
@@ -467,13 +583,27 @@ class FileManagerApp:
         local_frame = tk.LabelFrame(main_frame, text="Local Files", padx=5, pady=5)
         local_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         
-        self.local_tree = ttk.Treeview(local_frame, columns=('Size', 'Type'), selectmode='browse')
-        self.local_tree.heading('#0', text='Name')
-        self.local_tree.heading('Size', text='Size')
-        self.local_tree.heading('Type', text='Type')
-        self.local_tree.column('#0', width=250)
+        # Local drive selector inside local panel
+        local_drive_frame = tk.Frame(local_frame)
+        local_drive_frame.pack(fill=tk.X, pady=(0, 5))
+        tk.Label(local_drive_frame, text="Drive:").pack(side=tk.LEFT, padx=(0, 5))
+        self.local_drive_var = tk.StringVar()
+        self.local_drive_combo = ttk.Combobox(local_drive_frame, textvariable=self.local_drive_var, width=20)
+        self.local_drive_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.local_drive_combo.bind('<<ComboboxSelected>>', self.on_local_drive_change)
+        self.local_drive_combo.bind('<Return>', self.on_local_drive_manual)
+        tk.Button(local_drive_frame, text="⟳", width=3, command=self.refresh_local_panel).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Local file tree
+        self.local_tree = ttk.Treeview(local_frame, columns=('Size', 'Type', 'Date'), selectmode='browse')
+        self.local_tree.heading('#0', text='Name', command=lambda: self.toggle_sort('name'))
+        self.local_tree.heading('Size', text='Size', command=lambda: self.toggle_sort('size'))
+        self.local_tree.heading('Type', text='Type', command=lambda: self.toggle_sort('type'))
+        self.local_tree.heading('Date', text='Date', command=lambda: self.toggle_sort('date'))
+        self.local_tree.column('#0', width=200)
         self.local_tree.column('Size', width=100)
         self.local_tree.column('Type', width=80)
+        self.local_tree.column('Date', width=150)
         
         local_scroll = ttk.Scrollbar(local_frame, orient=tk.VERTICAL, command=self.local_tree.yview)
         self.local_tree.configure(yscrollcommand=local_scroll.set)
@@ -489,13 +619,27 @@ class FileManagerApp:
         remote_frame = tk.LabelFrame(main_frame, text="Remote Files (UDP)", padx=5, pady=5)
         remote_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
         
-        self.remote_tree = ttk.Treeview(remote_frame, columns=('Size', 'Type'), selectmode='browse')
-        self.remote_tree.heading('#0', text='Name')
-        self.remote_tree.heading('Size', text='Size')
-        self.remote_tree.heading('Type', text='Type')
-        self.remote_tree.column('#0', width=250)
+        # Remote drive selector inside remote panel
+        remote_drive_frame = tk.Frame(remote_frame)
+        remote_drive_frame.pack(fill=tk.X, pady=(0, 5))
+        tk.Label(remote_drive_frame, text="Server:").pack(side=tk.LEFT, padx=(0, 5))
+        self.remote_drive_var = tk.StringVar()
+        self.remote_drive_combo = ttk.Combobox(remote_drive_frame, textvariable=self.remote_drive_var, width=20)
+        self.remote_drive_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.remote_drive_combo.bind('<<ComboboxSelected>>', self.on_remote_drive_change)
+        self.remote_drive_combo.bind('<Return>', self.on_remote_drive_manual)
+        tk.Button(remote_drive_frame, text="⟳", width=3, command=self.refresh_remote_panel).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Remote file tree
+        self.remote_tree = ttk.Treeview(remote_frame, columns=('Size', 'Type', 'Date'), selectmode='browse')
+        self.remote_tree.heading('#0', text='Name', command=lambda: self.toggle_sort_remote('name'))
+        self.remote_tree.heading('Size', text='Size', command=lambda: self.toggle_sort_remote('size'))
+        self.remote_tree.heading('Type', text='Type', command=lambda: self.toggle_sort_remote('type'))
+        self.remote_tree.heading('Date', text='Date', command=lambda: self.toggle_sort_remote('date'))
+        self.remote_tree.column('#0', width=200)
         self.remote_tree.column('Size', width=100)
         self.remote_tree.column('Type', width=80)
+        self.remote_tree.column('Date', width=150)
         
         remote_scroll = ttk.Scrollbar(remote_frame, orient=tk.VERTICAL, command=self.remote_tree.yview)
         self.remote_tree.configure(yscrollcommand=remote_scroll.set)
@@ -517,6 +661,9 @@ class FileManagerApp:
         self.root.bind('<F2>', lambda e: self.rename_file())
         self.root.bind('<Control-R>', lambda e: self.refresh_all())
         self.root.bind('<Control-r>', lambda e: self.refresh_all())
+        
+        # Action buttons frame
+        self.setup_action_buttons()
         
     def setup_status_bar(self):
         """Setup status bar"""
@@ -562,22 +709,31 @@ class FileManagerApp:
             self.local_tree.delete(item)
             
         try:
-            entries = sorted(os.listdir(self.local_path))
-            for entry in entries:
+            entries = os.listdir(self.local_path)
+            # Sort entries
+            sorted_entries = self.sort_entries(entries, is_local=True)
+            
+            for entry in sorted_entries:
                 full_path = os.path.join(self.local_path, entry)
                 is_dir = os.path.isdir(full_path)
                 
                 if is_dir:
                     size = ''
                     ftype = 'DIR'
+                    date_str = ''
                 else:
                     try:
                         size = str(os.path.getsize(full_path))
                     except:
                         size = '?'
                     ftype = 'FILE'
+                    try:
+                        mtime = os.path.getmtime(full_path)
+                        date_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
+                    except:
+                        date_str = ''
                     
-                self.local_tree.insert('', 'end', text=entry, values=(size, ftype))
+                self.local_tree.insert('', 'end', text=entry, values=(size, ftype, date_str))
                 
             self.status_bar.config(text=f"Local: {self.local_path}")
         except Exception as e:
@@ -594,7 +750,12 @@ class FileManagerApp:
         try:
             entries = self.remote_client.list_dir(self.remote_path)
             if entries:
-                for entry in entries:
+                # Filter out empty entries
+                entries = [e for e in entries if e.strip()]
+                # Sort entries
+                sorted_entries = self.sort_entries(entries, is_local=False)
+                
+                for entry in sorted_entries:
                     if '|' in entry:
                         parts = entry.split('|')
                         name = parts[0]
@@ -603,8 +764,9 @@ class FileManagerApp:
                         
                         display_type = 'DIR' if ftype == 'dir' else 'FILE'
                         display_size = size if ftype == 'file' else ''
+                        date_str = ''  # Date not available from server
                         
-                        self.remote_tree.insert('', 'end', text=name, values=(display_size, display_type))
+                        self.remote_tree.insert('', 'end', text=name, values=(display_size, display_type, date_str))
                         
             self.status_bar.config(text=f"Remote: {self.remote_path} [{self.remote_server}]")
         except Exception as e:
@@ -674,12 +836,27 @@ class FileManagerApp:
             self.local_path = drive
             self.refresh_local_panel()
             
+    def on_local_drive_manual(self, event):
+        """Handle manual path entry for local drive"""
+        path = self.local_drive_var.get().strip()
+        if path and os.path.exists(path):
+            self.local_path = path
+            self.refresh_local_panel()
+            
     def on_remote_drive_change(self, event):
         """Handle remote drive change"""
         drive = self.remote_drive_var.get()
         if drive and self.remote_client.sock:
             if self.remote_client.change_dir(drive):
                 self.remote_path = drive
+                self.refresh_remote_panel()
+                
+    def on_remote_drive_manual(self, event):
+        """Handle manual path entry for remote drive"""
+        path = self.remote_drive_var.get().strip()
+        if path and self.remote_client.sock:
+            if self.remote_client.change_dir(path):
+                self.remote_path = path
                 self.refresh_remote_panel()
                 
     def switch_panel(self, event):
