@@ -1,1171 +1,843 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-UDP File Manager - Total Commander Style GUI
-Left panel: Local file system
-Right panel: Remote server via UDP
-Features:
-- Dual panel interface
-- Drive dropdown lists for both panels
-- UDP connection scanner
-- File operations (copy, delete, mkdir, rename)
+UDP File Manager - Клиент в стиле Total Commander
+Полноценный GUI с двухпанельным интерфейсом, поддержкой UDP и локальной ФС.
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import socket
 import os
-import json
+import sys
 import threading
-import struct
+import json
 import time
+import platform
+import subprocess
 from pathlib import Path
-import hashlib
+from datetime import datetime
 
-# Protocol constants
-CMD_LIST_DIR = 1
-CMD_GET_FILE = 2
-CMD_PUT_FILE = 3
-CMD_DELETE = 4
-CMD_MKDIR = 5
-CMD_RENAME = 6
-CMD_GET_DRIVES = 7
-CMD_CHANGE_DIR = 8
-RESPONSE_OK = 100
-RESPONSE_ERROR = 101
-RESPONSE_DATA = 102
+# Константы
+BUFFER_SIZE = 65535
+TIMEOUT = 5.0
+DEFAULT_PORT = 5000
 
 class UDPClient:
-    """UDP client for remote file operations"""
-    
-    def __init__(self, host='127.0.0.1', port=5000, timeout=5.0):
+    """Класс для работы с UDP сервером"""
+    def __init__(self, host='127.0.0.1', port=5000):
         self.host = host
         self.port = port
-        self.timeout = timeout
         self.sock = None
+        self.connected = False
         
     def connect(self):
-        """Establish UDP connection"""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(self.timeout)
-        
-    def disconnect(self):
-        """Close UDP connection"""
-        if self.sock:
-            self.sock.close()
-            self.sock = None
+        """Инициализация сокета"""
+        try:
+            if self.sock:
+                self.sock.close()
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(TIMEOUT)
+            self.connected = True
+            return True
+        except Exception as e:
+            print(f"Ошибка подключения: {e}")
+            self.connected = False
+            return False
             
-    def send_command(self, cmd, data=b''):
-        """Send command to server"""
-        if not self.sock:
-            self.connect()
-        
-        # Pack: cmd (1 byte) + data_len (4 bytes) + data
-        header = struct.pack('>BI', cmd, len(data))
-        packet = header + data
-        
-        self.sock.sendto(packet, (self.host, self.port))
-        
-    def receive_response(self):
-        """Receive response from server"""
-        if not self.sock:
-            return None, None
+    def send_request(self, command, data=None):
+        """Отправка команды серверу"""
+        if not self.connected:
+            if not self.connect():
+                return None
+                
+        request = {'command': command}
+        if data:
+            request['data'] = data
             
         try:
-            data, _ = self.sock.recvfrom(65535)
-            if len(data) < 5:
-                return None, None
-                
-            status = data[0]
-            data_len = struct.unpack('>I', data[1:5])[0]
-            payload = data[5:5+data_len] if data_len > 0 else b''
+            msg = json.dumps(request).encode('utf-8')
+            self.sock.sendto(msg, (self.host, self.port))
             
-            return status, payload
+            # Получение ответа
+            data, _ = self.sock.recvfrom(BUFFER_SIZE)
+            response = json.loads(data.decode('utf-8'))
+            
+            if response.get('status') == 'error':
+                raise Exception(response.get('message', 'Неизвестная ошибка'))
+                
+            return response.get('result')
         except socket.timeout:
-            return None, None
+            raise Exception("Превышено время ожидания ответа от сервера")
         except Exception as e:
-            return None, str(e).encode()
+            self.connected = False
+            raise Exception(f"Ошибка связи: {str(e)}")
             
     def list_dir(self, path):
-        """List directory contents"""
-        self.send_command(CMD_LIST_DIR, path.encode('utf-8'))
-        status, data = self.receive_response()
-        if status == RESPONSE_DATA:
-            return data.decode('utf-8').split('\n')
-        return None
+        """Получение списка файлов"""
+        return self.send_request('LIST_DIR', {'path': path})
         
     def get_drives(self):
-        """Get available drives"""
-        self.send_command(CMD_GET_DRIVES)
-        status, data = self.receive_response()
-        if status == RESPONSE_DATA:
-            return data.decode('utf-8').split('\n')
-        return None
-        
-    def change_dir(self, path):
-        """Change directory on server"""
-        self.send_command(CMD_CHANGE_DIR, path.encode('utf-8'))
-        status, _ = self.receive_response()
-        return status == RESPONSE_OK
+        """Получение списка дисков сервера"""
+        return self.send_request('GET_DRIVES')
         
     def download_file(self, remote_path, local_path):
-        """Download file from server"""
-        self.send_command(CMD_GET_FILE, remote_path.encode('utf-8'))
-        status, data = self.receive_response()
-        if status == RESPONSE_DATA:
-            with open(local_path, 'wb') as f:
-                f.write(data)
-            return True
-        return False
-        
-    def upload_file(self, local_path, remote_path):
-        """Upload file to server"""
-        with open(local_path, 'rb') as f:
-            data = f.read()
-        payload = remote_path.encode('utf-8') + b'\x00' + data
-        self.send_command(CMD_PUT_FILE, payload)
-        status, _ = self.receive_response()
-        return status == RESPONSE_OK
-        
-    def delete(self, path):
-        """Delete file or directory on server"""
-        self.send_command(CMD_DELETE, path.encode('utf-8'))
-        status, _ = self.receive_response()
-        return status == RESPONSE_OK
-        
-    def mkdir(self, path):
-        """Create directory on server"""
-        self.send_command(CMD_MKDIR, path.encode('utf-8'))
-        status, _ = self.receive_response()
-        return status == RESPONSE_OK
-        
-    def rename(self, old_path, new_path):
-        """Rename file or directory on server"""
-        payload = f"{old_path}\x00{new_path}".encode('utf-8')
-        self.send_command(CMD_RENAME, payload)
-        status, _ = self.receive_response()
-        return status == RESPONSE_OK
+        """Скачивание файла с сервера"""
+        return self.send_request('DOWNLOAD_FILE', {
+            'remote_path': remote_path,
+            'local_path': local_path
+        })
 
-
-class UDPServer:
-    """UDP server for file operations"""
-    
-    def __init__(self, host='0.0.0.0', port=5000):
-        self.host = host
-        self.port = port
-        self.sock = None
-        self.running = False
-        self.current_dir = os.getcwd()
-        
-    def start(self):
-        """Start the server"""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.host, self.port))
-        self.sock.settimeout(1.0)
-        self.running = True
-        
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(65535)
-                self.handle_request(data, addr)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"Server error: {e}")
-                
-    def stop(self):
-        """Stop the server"""
-        self.running = False
-        if self.sock:
-            self.sock.close()
-            
-    def handle_request(self, data, addr):
-        """Handle incoming request"""
-        if len(data) < 5:
-            return
-            
-        cmd = data[0]
-        data_len = struct.unpack('>I', data[1:5])[0]
-        payload = data[5:5+data_len] if data_len > 0 else b''
-        
-        try:
-            if cmd == CMD_LIST_DIR:
-                self.handle_list_dir(payload, addr)
-            elif cmd == CMD_GET_DRIVES:
-                self.handle_get_drives(addr)
-            elif cmd == CMD_CHANGE_DIR:
-                self.handle_change_dir(payload, addr)
-            elif cmd == CMD_GET_FILE:
-                self.handle_get_file(payload, addr)
-            elif cmd == CMD_PUT_FILE:
-                self.handle_put_file(payload, addr)
-            elif cmd == CMD_DELETE:
-                self.handle_delete(payload, addr)
-            elif cmd == CMD_MKDIR:
-                self.handle_mkdir(payload, addr)
-            elif cmd == CMD_RENAME:
-                self.handle_rename(payload, addr)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def send_response(self, addr, status, data=b''):
-        """Send response to client"""
-        header = struct.pack('>BI', status, len(data))
-        packet = header + data
-        self.sock.sendto(packet, addr)
-        
-    def handle_list_dir(self, payload, addr):
-        """Handle list directory request"""
-        path = payload.decode('utf-8')
-        if path:
-            target_dir = path
-        else:
-            target_dir = self.current_dir
-            
-        try:
-            entries = []
-            for item in os.listdir(target_dir):
-                full_path = os.path.join(target_dir, item)
-                is_dir = os.path.isdir(full_path)
-                size = os.path.getsize(full_path) if not is_dir else 0
-                entries.append(f"{item}|{'dir' if is_dir else 'file'}|{size}")
-                
-            self.send_response(addr, RESPONSE_DATA, '\n'.join(entries).encode())
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_get_drives(self, addr):
-        """Handle get drives request"""
-        try:
-            if os.name == 'nt':  # Windows
-                import string
-                drives = []
-                for letter in string.ascii_uppercase:
-                    drive = f"{letter}:\\"
-                    if os.path.exists(drive):
-                        drives.append(drive)
-                self.send_response(addr, RESPONSE_DATA, '\n'.join(drives).encode())
-            else:  # Linux/Mac
-                drives = ['/']
-                for item in os.listdir('/'):
-                    full_path = os.path.join('/', item)
-                    if os.path.isdir(full_path) and not item.startswith('.'):
-                        drives.append(full_path)
-                self.send_response(addr, RESPONSE_DATA, '\n'.join(drives).encode())
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_change_dir(self, payload, addr):
-        """Handle change directory request"""
-        path = payload.decode('utf-8')
-        try:
-            if os.path.isdir(path):
-                self.current_dir = path
-                self.send_response(addr, RESPONSE_OK)
-            else:
-                self.send_response(addr, RESPONSE_ERROR, b"Directory not found")
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_get_file(self, payload, addr):
-        """Handle get file request"""
-        path = payload.decode('utf-8')
-        try:
-            with open(path, 'rb') as f:
-                data = f.read()
-            self.send_response(addr, RESPONSE_DATA, data)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_put_file(self, payload, addr):
-        """Handle put file request"""
-        try:
-            null_idx = payload.index(b'\x00'[0])
-            path = payload[:null_idx].decode('utf-8')
-            file_data = payload[null_idx+1:]
-            
-            with open(path, 'wb') as f:
-                f.write(file_data)
-            self.send_response(addr, RESPONSE_OK)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_delete(self, payload, addr):
-        """Handle delete request"""
-        path = payload.decode('utf-8')
-        try:
-            if os.path.isfile(path):
-                os.remove(path)
-            elif os.path.isdir(path):
-                os.rmdir(path)
-            self.send_response(addr, RESPONSE_OK)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_mkdir(self, payload, addr):
-        """Handle mkdir request"""
-        path = payload.decode('utf-8')
-        try:
-            os.makedirs(path, exist_ok=True)
-            self.send_response(addr, RESPONSE_OK)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-            
-    def handle_rename(self, payload, addr):
-        """Handle rename request"""
-        parts = payload.decode('utf-8').split('\x00')
-        if len(parts) != 2:
-            self.send_response(addr, RESPONSE_ERROR, b"Invalid rename format")
-            return
-            
-        old_path, new_path = parts
-        try:
-            os.rename(old_path, new_path)
-            self.send_response(addr, RESPONSE_OK)
-        except Exception as e:
-            self.send_response(addr, RESPONSE_ERROR, str(e).encode())
-
-
-class UDPScanner:
-    """Scanner for finding UDP servers"""
-    
-    @staticmethod
-    def scan_network(network_prefix='192.168.1', port=5000, timeout=1.0):
-        """Scan network for UDP servers"""
+    def scan_network(self, port=5000, timeout=1.0):
+        """Поиск активных серверов в локальной сети"""
         found_servers = []
+        # Получаем локальный IP для определения подсети
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except:
+            local_ip = "127.0.0.1"
+            
+        base_ip = '.'.join(local_ip.split('.')[:3])
         
-        def scan_ip(ip):
+        def check_host(ip):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.settimeout(timeout)
-                
-                # Send a test packet (GET_DRIVES command)
-                header = struct.pack('>BI', CMD_GET_DRIVES, 0)
-                sock.sendto(header, (ip, port))
-                
-                # Wait for response
-                try:
-                    data, _ = sock.recvfrom(1024)
-                    if len(data) >= 1 and data[0] in [RESPONSE_OK, RESPONSE_DATA, RESPONSE_ERROR]:
-                        found_servers.append(ip)
-                except socket.timeout:
-                    pass
-                finally:
-                    sock.close()
+                req = json.dumps({'command': 'PING'}).encode('utf-8')
+                sock.sendto(req, (ip, port))
+                data, _ = sock.recvfrom(1024)
+                if data:
+                    found_servers.append(ip)
+                sock.close()
             except:
                 pass
                 
-        # Scan common IPs
-        ips_to_scan = [
-            '127.0.0.1',
-            f'{network_prefix}.1',
-            f'{network_prefix}.10',
-            f'{network_prefix}.100',
-            f'{network_prefix}.254',
-        ]
-        
         threads = []
-        for ip in ips_to_scan:
-            t = threading.Thread(target=scan_ip, args=(ip,))
+        for i in range(1, 255):
+            ip = f"{base_ip}.{i}"
+            t = threading.Thread(target=check_host, args=(ip,))
             t.start()
             threads.append(t)
-            
-        for t in threads:
-            t.join()
-            
+            # Ограничение количества одновременных потоков
+            if len(threads) % 50 == 0:
+                for t in threads: t.join()
+                threads = []
+                
+        for t in threads: t.join()
         return found_servers
 
 
 class FileManagerApp:
-    """Main application class"""
-    
     def __init__(self, root):
         self.root = root
-        self.root.title("UDP File Manager - Total Commander Style")
-        self.root.geometry("1200x700")
+        self.root.title("UDP File Manager (Total Commander Style)")
+        self.root.geometry("1200x800")
         
-        # State
+        # Состояние
         self.local_path = os.getcwd()
-        self.remote_path = '/'
-        self.remote_server = None
-        self.remote_client = UDPClient()
-        self.active_panel = 'local'  # 'local' or 'remote'
-        self.sort_mode = 'name'  # 'name', 'size', 'date', 'type'
+        self.remote_path = "/"
+        self.server_address = "127.0.0.1"
+        self.server_port = DEFAULT_PORT
+        self.udp_client = UDPClient()
+        self.is_connected = False
+        self.active_panel = 'local' # 'local' или 'remote'
+        self.sort_key = 'name'
         self.sort_reverse = False
         
-        # Setup UI
-        self.setup_menu()
-        self.setup_main_area()
-        self.setup_status_bar()
+        # Настройка стилей
+        self.setup_styles()
         
-        # Load initial directories
-        self.refresh_local_panel()
+        # Создание интерфейса
+        self.create_menu()
+        self.create_toolbar()
+        self.create_connection_bar()
+        self.create_main_area()
+        self.create_status_bar()
         
-    def setup_menu(self):
-        """Setup menu bar"""
+        # Обновление панелей
+        self.refresh_local()
+        
+    def setup_styles(self):
+        """Настройка цветов и шрифтов"""
+        self.colors = {
+            'bg': '#f0f0f0',
+            'panel_bg': '#ffffff',
+            'select_bg': '#3399ff',
+            'select_fg': '#ffffff',
+            'dir_color': '#000080',
+            'exe_color': '#008000',
+            'text_font': ('Consolas', 10) if platform.system() == 'Windows' else ('DejaVu Sans Mono', 10),
+            'header_font': ('Arial', 9, 'bold')
+        }
+        self.root.configure(bg=self.colors['bg'])
+        
+    def create_menu(self):
+        """Создание меню"""
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
         
-        # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Connect to Server...", command=self.connect_server)
-        file_menu.add_command(label="Disconnect", command=self.disconnect_server)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Выход", command=self.root.quit)
         
-        # Network menu
         net_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Network", menu=net_menu)
-        net_menu.add_command(label="Scan for Servers...", command=self.scan_servers)
-        net_menu.add_command(label="Manual Connect...", command=self.manual_connect)
+        menubar.add_cascade(label="Сеть", menu=net_menu)
+        net_menu.add_command(label="Поиск серверов", command=self.scan_network_gui)
+        net_menu.add_command(label="Переподключиться", command=self.connect_to_server)
         
-        # View menu - Sorting
-        view_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="View", menu=view_menu)
-        sort_submenu = tk.Menu(view_menu, tearoff=0)
-        view_menu.add_cascade(label="Sort by", menu=sort_submenu)
-        sort_submenu.add_radiobutton(label="Name", command=lambda: self.set_sort_mode('name'))
-        sort_submenu.add_radiobutton(label="Size", command=lambda: self.set_sort_mode('size'))
-        sort_submenu.add_radiobutton(label="Date", command=lambda: self.set_sort_mode('date'))
-        sort_submenu.add_radiobutton(label="Type", command=lambda: self.set_sort_mode('type'))
-        view_menu.add_separator()
-        view_menu.add_command(label="Toggle Sort Order", command=self.toggle_sort_order)
-        
-        # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
-        help_menu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Справка", menu=help_menu)
+        help_menu.add_command(label="О программе", command=self.show_about)
         
-    def setup_action_buttons(self):
-        """Setup action buttons at the bottom"""
-        btn_frame = tk.Frame(self.root)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+    def create_toolbar(self):
+        """Панель инструментов с кнопками"""
+        toolbar = tk.Frame(self.root, bg=self.colors['bg'], pady=5)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
         
-        # Copy from remote to local button
-        tk.Button(btn_frame, text="⬇ Download Selected", command=self.download_selected, bg='#90EE90').pack(side=tk.LEFT, padx=5)
+        btn_style = {'width': 10, 'padx': 5}
         
-        # Copy from local to remote button
-        tk.Button(btn_frame, text="⬆ Upload Selected", command=self.upload_selected, bg='#87CEEB').pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="F5 Копировать", command=self.copy_files, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="Скачать", command=self.download_selected, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="F7 Папка", command=self.create_directory, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="F8 Удалить", command=self.delete_files, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="F2 Переим.", command=self.rename_file, **btn_style).pack(side=tk.LEFT, padx=2)
         
-        # Scan button
-        tk.Button(btn_frame, text="🔍 Scan UDP Servers", command=self.scan_servers, bg='#FFD700').pack(side=tk.RIGHT, padx=5)
+        tk.Label(toolbar, text=" | ", bg=self.colors['bg']).pack(side=tk.LEFT, padx=5)
         
-        # Connection status label
-        self.connection_label = tk.Label(btn_frame, text="Disconnected", fg='red')
-        self.connection_label.pack(side=tk.RIGHT, padx=10)
+        tk.Button(toolbar, text="Обновить (Ctrl+R)", command=self.refresh_all, **btn_style).pack(side=tk.LEFT, padx=2)
         
-    def download_selected(self):
-        """Download selected file from remote to local"""
-        selection = self.remote_tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "No file selected")
-            return
-            
-        item = selection[0]
-        name = self.remote_tree.item(item, 'text')
-        ftype = self.remote_tree.item(item, 'values')[1]
+    def create_connection_bar(self):
+        """Панель подключения к серверу"""
+        conn_frame = tk.Frame(self.root, bg='#e0e0e0', pady=5, padx=10)
+        conn_frame.pack(side=tk.TOP, fill=tk.X)
         
-        if ftype == 'DIR':
-            messagebox.showwarning("Warning", "Directory download not supported yet")
-            return
-            
-        src_path = os.path.join(self.remote_path, name)
-        dst_path = os.path.join(self.local_path, name)
+        tk.Label(conn_frame, text="Сервер:", bg='#e0e0e0').pack(side=tk.LEFT)
         
-        if self.remote_client.download_file(src_path, dst_path):
-            self.refresh_local_panel()
-            self.status_bar.config(text=f"Downloaded {name} from remote")
-        else:
-            messagebox.showerror("Error", "Failed to download file")
-            
-    def upload_selected(self):
-        """Upload selected file from local to remote"""
-        selection = self.local_tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "No file selected")
-            return
-            
-        item = selection[0]
-        name = self.local_tree.item(item, 'text')
-        ftype = self.local_tree.item(item, 'values')[1]
+        self.ip_entry = tk.Entry(conn_frame, width=15)
+        self.ip_entry.insert(0, self.server_address)
+        self.ip_entry.pack(side=tk.LEFT, padx=5)
         
-        if ftype == 'DIR':
-            messagebox.showwarning("Warning", "Directory upload not supported yet")
-            return
-            
-        src_path = os.path.join(self.local_path, name)
-        dst_path = os.path.join(self.remote_path, name)
+        tk.Label(conn_frame, text=":", bg='#e0e0e0').pack(side=tk.LEFT)
         
-        if self.remote_client.upload_file(src_path, dst_path):
-            self.refresh_remote_panel()
-            self.status_bar.config(text=f"Uploaded {name} to remote")
-        else:
-            messagebox.showerror("Error", "Failed to upload file")
-
-    def set_sort_mode(self, mode):
-        """Set sort mode"""
-        self.sort_mode = mode
-        self.refresh_local_panel()
-        if self.remote_client.sock:
-            self.refresh_remote_panel()
-            
-    def toggle_sort_order(self):
-        """Toggle sort order"""
-        self.sort_reverse = not self.sort_reverse
-        self.refresh_local_panel()
-        if self.remote_client.sock:
-            self.refresh_remote_panel()
-            
-    def toggle_sort(self, column):
-        """Toggle sort for local panel"""
-        if self.sort_mode == column:
-            self.sort_reverse = not self.sort_reverse
-        else:
-            self.sort_mode = column
-            self.sort_reverse = False
-        self.refresh_local_panel()
+        self.port_entry = tk.Entry(conn_frame, width=6)
+        self.port_entry.insert(0, str(self.server_port))
+        self.port_entry.pack(side=tk.LEFT, padx=5)
         
-    def toggle_sort_remote(self, column):
-        """Toggle sort for remote panel"""
-        if self.sort_mode == column:
-            self.sort_reverse = not self.sort_reverse
-        else:
-            self.sort_mode = column
-            self.sort_reverse = False
-        if self.remote_client.sock:
-            self.refresh_remote_panel()
-            
-    def sort_entries(self, entries, is_local=True):
-        """Sort entries based on current sort mode"""
-        def get_sort_key(entry):
-            if is_local:
-                name = entry
-                full_path = os.path.join(self.local_path, name)
-                is_dir = os.path.isdir(full_path)
-                if self.sort_mode == 'size':
-                    return (0 if is_dir else os.path.getsize(full_path), name)
-                elif self.sort_mode == 'date':
-                    return (0 if is_dir else os.path.getmtime(full_path), name)
-                elif self.sort_mode == 'type':
-                    ext = os.path.splitext(name)[1].lower()
-                    return (0 if is_dir else ext, name)
-                else:  # name
-                    return (0 if is_dir else 1, name.lower())
-            else:
-                # Remote entry format: name|type|size
-                parts = entry.split('|')
-                name = parts[0]
-                ftype = parts[1] if len(parts) > 1 else 'file'
-                size = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-                is_dir = ftype == 'dir'
-                
-                if self.sort_mode == 'size':
-                    return (0 if is_dir else size, name)
-                elif self.sort_mode == 'date':
-                    # Date not available from server, use name as fallback
-                    return (0 if is_dir else 0, name)
-                elif self.sort_mode == 'type':
-                    ext = os.path.splitext(name)[1].lower()
-                    return (0 if is_dir else ext, name)
-                else:  # name
-                    return (0 if is_dir else 1, name.lower())
+        self.conn_btn = tk.Button(conn_frame, text="Подключиться", command=self.toggle_connection, bg='#dddddd')
+        self.conn_btn.pack(side=tk.LEFT, padx=10)
         
-        return sorted(entries, key=get_sort_key, reverse=self.sort_reverse)
+        self.status_label = tk.Label(conn_frame, text="Отключено", fg='red', bg='#e0e0e0')
+        self.status_label.pack(side=tk.LEFT, padx=10)
         
-    def setup_main_area(self):
-        """Setup main area with two panels"""
-        # Main container
-        main_frame = tk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    def create_main_area(self):
+        """Основная область с двумя панелями"""
+        main_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.colors['bg'])
+        main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Local panel (left)
-        local_frame = tk.LabelFrame(main_frame, text="Local Files", padx=5, pady=5)
-        local_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        # --- ЛЕВАЯ ПАНЕЛЬ (ЛОКАЛЬНАЯ) ---
+        left_frame = tk.Frame(main_paned, bg=self.colors['panel_bg'])
+        main_paned.add(left_frame, width=550)
         
-        # Local drive selector inside local panel
-        local_drive_frame = tk.Frame(local_frame)
-        local_drive_frame.pack(fill=tk.X, pady=(0, 5))
-        tk.Label(local_drive_frame, text="Drive:").pack(side=tk.LEFT, padx=(0, 5))
+        # Заголовок и диск
+        l_top = tk.Frame(left_frame, bg=self.colors['panel_bg'])
+        l_top.pack(fill=tk.X, padx=2, pady=2)
+        tk.Label(l_top, text="Локальный компьютер", font=self.colors['header_font'], bg=self.colors['panel_bg']).pack(side=tk.LEFT)
+        
         self.local_drive_var = tk.StringVar()
-        self.local_drive_combo = ttk.Combobox(local_drive_frame, textvariable=self.local_drive_var, width=20)
-        self.local_drive_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.local_drive_combo = ttk.Combobox(l_top, textvariable=self.local_drive_var, width=10, state='editable')
+        self.local_drive_combo.pack(side=tk.RIGHT)
         self.local_drive_combo.bind('<<ComboboxSelected>>', self.on_local_drive_change)
-        self.local_drive_combo.bind('<Return>', self.on_local_drive_manual)
-        tk.Button(local_drive_frame, text="⟳", width=3, command=self.refresh_local_panel).pack(side=tk.LEFT, padx=(5, 0))
+        self.local_drive_combo.bind('<Return>', self.on_local_drive_enter)
+        self.update_local_drives()
         
-        # Local file tree
-        self.local_tree = ttk.Treeview(local_frame, columns=('Size', 'Type', 'Date'), selectmode='browse')
-        self.local_tree.heading('#0', text='Name', command=lambda: self.toggle_sort('name'))
-        self.local_tree.heading('Size', text='Size', command=lambda: self.toggle_sort('size'))
-        self.local_tree.heading('Type', text='Type', command=lambda: self.toggle_sort('type'))
-        self.local_tree.heading('Date', text='Date', command=lambda: self.toggle_sort('date'))
-        self.local_tree.column('#0', width=200)
-        self.local_tree.column('Size', width=100)
-        self.local_tree.column('Type', width=80)
-        self.local_tree.column('Date', width=150)
+        # Путь
+        self.local_path_label = tk.Label(left_frame, text=self.local_path, anchor='w', bg='#ffffcc', relief=tk.SUNKEN)
+        self.local_path_label.pack(fill=tk.X, padx=2, pady=2)
         
-        local_scroll = ttk.Scrollbar(local_frame, orient=tk.VERTICAL, command=self.local_tree.yview)
-        self.local_tree.configure(yscrollcommand=local_scroll.set)
+        # Таблица файлов
+        self.local_tree = self.create_file_table(left_frame, self.on_local_double_click)
+        self.local_tree.bind('<FocusIn>', lambda e: self.set_active_panel('local'))
+        self.local_tree.bind('<Return>', self.on_local_enter_key)
         
-        self.local_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        local_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # --- ПРАВАЯ ПАНЕЛЬ (УДАЛЕННАЯ) ---
+        right_frame = tk.Frame(main_paned, bg=self.colors['panel_bg'])
+        main_paned.add(right_frame, width=550)
         
-        self.local_tree.bind('<Double-1>', self.on_local_double_click)
-        self.local_tree.bind('<Return>', self.on_local_enter)
-        self.local_tree.bind('<BackSpace>', lambda e: self.go_up_local())
+        # Заголовок и диск
+        r_top = tk.Frame(right_frame, bg=self.colors['panel_bg'])
+        r_top.pack(fill=tk.X, padx=2, pady=2)
+        tk.Label(r_top, text="Удаленный сервер", font=self.colors['header_font'], bg=self.colors['panel_bg']).pack(side=tk.LEFT)
         
-        # Remote panel (right)
-        remote_frame = tk.LabelFrame(main_frame, text="Remote Files (UDP)", padx=5, pady=5)
-        remote_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
-        # Remote drive selector inside remote panel
-        remote_drive_frame = tk.Frame(remote_frame)
-        remote_drive_frame.pack(fill=tk.X, pady=(0, 5))
-        tk.Label(remote_drive_frame, text="Server:").pack(side=tk.LEFT, padx=(0, 5))
         self.remote_drive_var = tk.StringVar()
-        self.remote_drive_combo = ttk.Combobox(remote_drive_frame, textvariable=self.remote_drive_var, width=20)
-        self.remote_drive_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.remote_drive_combo = ttk.Combobox(r_top, textvariable=self.remote_drive_var, width=10, state='editable')
+        self.remote_drive_combo.pack(side=tk.RIGHT)
         self.remote_drive_combo.bind('<<ComboboxSelected>>', self.on_remote_drive_change)
-        self.remote_drive_combo.bind('<Return>', self.on_remote_drive_manual)
-        tk.Button(remote_drive_frame, text="⟳", width=3, command=self.refresh_remote_panel).pack(side=tk.LEFT, padx=(5, 0))
+        self.remote_drive_combo.bind('<Return>', self.on_remote_drive_enter)
         
-        # Remote file tree
-        self.remote_tree = ttk.Treeview(remote_frame, columns=('Size', 'Type', 'Date'), selectmode='browse')
-        self.remote_tree.heading('#0', text='Name', command=lambda: self.toggle_sort_remote('name'))
-        self.remote_tree.heading('Size', text='Size', command=lambda: self.toggle_sort_remote('size'))
-        self.remote_tree.heading('Type', text='Type', command=lambda: self.toggle_sort_remote('type'))
-        self.remote_tree.heading('Date', text='Date', command=lambda: self.toggle_sort_remote('date'))
-        self.remote_tree.column('#0', width=200)
-        self.remote_tree.column('Size', width=100)
-        self.remote_tree.column('Type', width=80)
-        self.remote_tree.column('Date', width=150)
+        # Путь
+        self.remote_path_label = tk.Label(right_frame, text="Не подключено", anchor='w', bg='#ffffcc', relief=tk.SUNKEN)
+        self.remote_path_label.pack(fill=tk.X, padx=2, pady=2)
         
-        remote_scroll = ttk.Scrollbar(remote_frame, orient=tk.VERTICAL, command=self.remote_tree.yview)
-        self.remote_tree.configure(yscrollcommand=remote_scroll.set)
+        # Таблица файлов
+        self.remote_tree = self.create_file_table(right_frame, self.on_remote_double_click)
+        self.remote_tree.bind('<FocusIn>', lambda e: self.set_active_panel('remote'))
+        self.remote_tree.bind('<Return>', self.on_remote_enter_key)
         
-        self.remote_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        remote_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.remote_tree.bind('<Double-1>', self.on_remote_double_click)
-        self.remote_tree.bind('<Return>', self.on_remote_enter)
-        self.remote_tree.bind('<BackSpace>', lambda e: self.go_up_remote())
-        
-        # Bind Tab to switch panels
+        # Привязка клавиш навигации
         self.root.bind('<Tab>', self.switch_panel)
-        
-        # Bind function keys
-        self.root.bind('<F5>', lambda e: self.copy_file())
-        self.root.bind('<F7>', lambda e: self.create_directory())
-        self.root.bind('<F8>', lambda e: self.delete_file())
-        self.root.bind('<F2>', lambda e: self.rename_file())
         self.root.bind('<Control-R>', lambda e: self.refresh_all())
         self.root.bind('<Control-r>', lambda e: self.refresh_all())
+        self.root.bind('<F5>', lambda e: self.copy_files())
+        self.root.bind('<F7>', lambda e: self.create_directory())
+        self.root.bind('<F8>', lambda e: self.delete_files())
+        self.root.bind('<BackSpace>', self.go_up_dir)
         
-        # Action buttons frame
-        self.setup_action_buttons()
+    def create_file_table(self, parent, double_click_cmd):
+        """Создание таблицы файлов (Treeview)"""
+        cols = ('size', 'date', 'type')
+        tree = ttk.Treeview(parent, columns=cols, show='headings', selectmode='extended')
         
-    def setup_status_bar(self):
-        """Setup status bar"""
-        self.status_bar = tk.Label(self.root, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        tree.heading('name', text='Имя', command=lambda: self.sort_files(tree, 'name'))
+        tree.heading('size', text='Размер', command=lambda: self.sort_files(tree, 'size'))
+        tree.heading('date', text='Дата', command=lambda: self.sort_files(tree, 'date'))
+        tree.heading('type', text='Тип', command=lambda: self.sort_files(tree, 'type'))
+        
+        tree.column('name', width=250)
+        tree.column('size', width=80, anchor='e')
+        tree.column('date', width=120, anchor='center')
+        tree.column('type', width=80, anchor='center')
+        
+        # Скроллбары
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+        
+        tree.bind('<Double-1>', double_click_cmd)
+        return tree
+        
+    def create_status_bar(self):
+        """Строка состояния"""
+        self.status_bar = tk.Label(self.root, text="Готово", anchor='w', relief=tk.SUNKEN, bd=1)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
-    def populate_local_drives(self):
-        """Populate local drive dropdown"""
-        if os.name == 'nt':  # Windows
+    # --- ЛОГИКА РАБОТЫ С ФАЙЛАМИ ---
+    
+    def update_local_drives(self):
+        """Обновление списка локальных дисков"""
+        drives = []
+        system = platform.system()
+        if system == 'Windows':
             import string
-            drives = []
+            from ctypes import windll
+            bitmask = windll.kernel32.GetLogicalDrives()
             for letter in string.ascii_uppercase:
-                drive = f"{letter}:\\"
-                if os.path.exists(drive):
-                    drives.append(drive)
-            self.local_drive_combo['values'] = drives
-            if drives:
-                self.local_drive_var.set(drives[0])
-        else:  # Linux/Mac
-            drives = ['/']
-            for item in os.listdir('/'):
-                full_path = os.path.join('/', item)
-                if os.path.isdir(full_path) and not item.startswith('.'):
-                    drives.append(full_path)
-            self.local_drive_combo['values'] = drives
-            self.local_drive_var.set('/')
-            
-    def populate_remote_drives(self):
-        """Populate remote drive dropdown"""
-        if self.remote_client.sock:
+                if bitmask & 1:
+                    drives.append(f"{letter}:\\")
+                bitmask >>= 1
+        else:
+            # Для Linux/Unix добавляем корень и основные точки монтирования
+            drives = ['/', '/home', '/mnt', '/media']
             try:
-                drives = self.remote_client.get_drives()
-                if drives:
-                    self.remote_drive_combo['values'] = drives
-                    if drives:
-                        self.remote_drive_var.set(drives[0])
+                with open('/proc/mounts', 'r') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) > 1 and parts[1].startswith('/'):
+                            mount = parts[1]
+                            if mount not in drives and not mount.startswith('/proc') and not mount.startswith('/sys'):
+                                drives.append(mount)
             except:
                 pass
-                
-    def refresh_local_panel(self):
-        """Refresh local file panel"""
-        for item in self.local_tree.get_children():
-            self.local_tree.delete(item)
-            
-        try:
-            entries = os.listdir(self.local_path)
-            # Sort entries
-            sorted_entries = self.sort_entries(entries, is_local=True)
-            
-            for entry in sorted_entries:
-                full_path = os.path.join(self.local_path, entry)
-                is_dir = os.path.isdir(full_path)
-                
-                if is_dir:
-                    size = ''
-                    ftype = 'DIR'
-                    date_str = ''
-                else:
-                    try:
-                        size = str(os.path.getsize(full_path))
-                    except:
-                        size = '?'
-                    ftype = 'FILE'
-                    try:
-                        mtime = os.path.getmtime(full_path)
-                        date_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
-                    except:
-                        date_str = ''
-                    
-                self.local_tree.insert('', 'end', text=entry, values=(size, ftype, date_str))
-                
-            self.status_bar.config(text=f"Local: {self.local_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to read directory: {e}")
-            
-    def refresh_remote_panel(self):
-        """Refresh remote file panel"""
-        if not self.remote_client.sock:
-            return
-            
-        for item in self.remote_tree.get_children():
-            self.remote_tree.delete(item)
-            
-        try:
-            entries = self.remote_client.list_dir(self.remote_path)
-            if entries:
-                # Filter out empty entries
-                entries = [e for e in entries if e.strip()]
-                # Sort entries
-                sorted_entries = self.sort_entries(entries, is_local=False)
-                
-                for entry in sorted_entries:
-                    if '|' in entry:
-                        parts = entry.split('|')
-                        name = parts[0]
-                        ftype = parts[1]
-                        size = parts[2] if len(parts) > 2 else ''
-                        
-                        display_type = 'DIR' if ftype == 'dir' else 'FILE'
-                        display_size = size if ftype == 'file' else ''
-                        date_str = ''  # Date not available from server
-                        
-                        self.remote_tree.insert('', 'end', text=name, values=(display_size, display_type, date_str))
-                        
-            self.status_bar.config(text=f"Remote: {self.remote_path} [{self.remote_server}]")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to read remote directory: {e}")
-            
-    def on_local_double_click(self, event):
-        """Handle double click on local file"""
-        selection = self.local_tree.selection()
-        if not selection:
-            return
-            
-        item = selection[0]
-        name = self.local_tree.item(item, 'text')
-        ftype = self.local_tree.item(item, 'values')[1]
         
-        if ftype == 'DIR':
+        current = self.local_drive_var.get()
+        self.local_drive_combo['values'] = drives
+        if not current and drives:
+            self.local_drive_var.set(drives[0])
+            
+    def update_remote_drives(self):
+        """Запрос списка дисков у сервера"""
+        if not self.is_connected:
+            return
+        try:
+            drives = self.udp_client.get_drives()
+            if drives:
+                self.remote_drive_combo['values'] = drives
+        except Exception as e:
+            print(f"Ошибка получения дисков: {e}")
+
+    def refresh_local(self):
+        """Обновление локальной панели"""
+        self.local_tree.delete(*self.local_tree.get_children())
+        self.local_path_label.config(text=self.local_path)
+        
+        # Добавляем ".." если не в корне
+        if self.local_path != os.path.dirname(self.local_path) and self.local_path != '/':
+             # Простая проверка на корень для разных ОС
+            is_root = False
+            if platform.system() == 'Windows':
+                is_root = len(self.local_path) <= 3 # C:\
+            else:
+                is_root = self.local_path == '/'
+            
+            if not is_root:
+                self.local_tree.insert('', 'end', values=('..', '', 'Папка', 'DIR'), tags=('dir',))
+
+        try:
+            items = []
+            with os.scandir(self.local_path) as it:
+                for entry in it:
+                    try:
+                        size = entry.stat().st_size if entry.is_file() else ''
+                        mtime = datetime.fromtimestamp(entry.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
+                        f_type = 'Папка' if entry.is_dir() else os.path.splitext(entry.name)[1].upper().replace('.', '') or 'FILE'
+                        
+                        # Форматирование размера
+                        if size and size != '':
+                            if size > 1024*1024:
+                                size_str = f"{size/(1024*1024):.1f} MB"
+                            elif size > 1024:
+                                size_str = f"{size/1024:.1f} KB"
+                            else:
+                                size_str = f"{size} B"
+                        else:
+                            size_str = ''
+                            
+                        items.append((entry.name, size_str, mtime, f_type, entry.is_dir()))
+                    except PermissionError:
+                        continue
+            
+            # Сортировка
+            items.sort(key=lambda x: (not x[4], x[0])) # Папки первыми
+            
+            for name, size, date, ftype, is_dir in items:
+                tag = 'dir' if is_dir else 'file'
+                self.local_tree.insert('', 'end', values=(name, size, date, ftype), tags=(tag,))
+                
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать директорию: {e}")
+            
+    def refresh_remote(self):
+        """Обновление удаленной панели"""
+        self.remote_tree.delete(*self.remote_tree.get_children())
+        if not self.is_connected:
+            self.remote_path_label.config(text="Не подключено")
+            return
+            
+        self.remote_path_label.config(text=self.remote_path)
+        
+        try:
+            data = self.udp_client.list_dir(self.remote_path)
+            if not data:
+                return
+                
+            items = []
+            for item in data:
+                name = item['name']
+                if name == '..':
+                    continue
+                size = item.get('size', '')
+                if size and size != '':
+                     if isinstance(size, int):
+                        if size > 1024*1024:
+                            size_str = f"{size/(1024*1024):.1f} MB"
+                        elif size > 1024:
+                            size_str = f"{size/1024:.1f} KB"
+                        else:
+                            size_str = f"{size} B"
+                     else:
+                         size_str = str(size)
+                else:
+                    size_str = ''
+                    
+                date = item.get('date', '')
+                ftype = 'Папка' if item.get('is_dir') else 'FILE'
+                is_dir = item.get('is_dir', False)
+                items.append((name, size_str, date, ftype, is_dir))
+            
+            items.sort(key=lambda x: (not x[4], x[0]))
+            
+            for name, size, date, ftype, is_dir in items:
+                tag = 'dir' if is_dir else 'file'
+                self.remote_tree.insert('', 'end', values=(name, size, date, ftype), tags=(tag,))
+                
+        except Exception as e:
+            self.status_bar.config(text=f"Ошибка сервера: {e}", fg='red')
+
+    # --- ОБРАБОТЧИКИ СОБЫТИЙ ---
+    
+    def on_local_double_click(self, event):
+        selection = self.local_tree.selection()
+        if not selection: return
+        item = self.local_tree.item(selection[0])
+        name = item['values'][0]
+        
+        if name == '..':
+            self.local_path = os.path.dirname(self.local_path)
+            self.refresh_local()
+        elif item['tags'][0] == 'dir':
             self.local_path = os.path.join(self.local_path, name)
-            self.refresh_local_panel()
-            self.local_drive_var.set(self.local_path)
+            self.refresh_local()
+        else:
+            # Открытие файла
+            self.open_local_file(name)
+            
+    def open_local_file(self, filename):
+        """Открытие файла стандартной программой"""
+        filepath = os.path.join(self.local_path, filename)
+        try:
+            if platform.system() == 'Windows':
+                os.startfile(filepath)
+            elif platform.system() == 'Darwin':
+                subprocess.run(['open', filepath])
+            else:
+                subprocess.run(['xdg-open', filepath])
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось открыть файл: {e}")
             
     def on_remote_double_click(self, event):
-        """Handle double click on remote file"""
+        if not self.is_connected: return
         selection = self.remote_tree.selection()
-        if not selection:
-            return
-            
-        item = selection[0]
-        name = self.remote_tree.item(item, 'text')
-        ftype = self.remote_tree.item(item, 'values')[1]
+        if not selection: return
+        item = self.remote_tree.item(selection[0])
+        name = item['values'][0]
         
-        if ftype == 'DIR':
-            if name == '..':
-                self.go_up_remote()
+        if name == '..':
+            self.remote_path = os.path.dirname(self.remote_path)
+            if self.remote_path == '': self.remote_path = '/'
+            self.refresh_remote()
+        elif item['tags'][0] == 'dir':
+            if self.remote_path.endswith('/'):
+                self.remote_path += name
             else:
-                self.remote_path = os.path.join(self.remote_path, name)
-                if self.remote_client.change_dir(self.remote_path):
-                    self.refresh_remote_panel()
-                    
-    def on_local_enter(self, event):
-        """Handle Enter key on local panel"""
-        self.on_local_double_click(event)
-        
-    def on_remote_enter(self, event):
-        """Handle Enter key on remote panel"""
-        self.on_remote_double_click(event)
-        
-    def go_up_local(self):
-        """Go up one directory in local panel"""
-        parent = os.path.dirname(self.local_path)
-        if parent and parent != self.local_path:
-            self.local_path = parent
-            self.refresh_local_panel()
-            self.local_drive_var.set(self.local_path)
-            
-    def go_up_remote(self):
-        """Go up one directory in remote panel"""
-        parent = os.path.dirname(self.remote_path)
-        if parent and parent != self.remote_path:
-            self.remote_path = parent
-            if self.remote_client.change_dir(self.remote_path):
-                self.refresh_remote_panel()
-                
-    def on_local_drive_change(self, event):
-        """Handle local drive change"""
-        drive = self.local_drive_var.get()
-        if drive and os.path.exists(drive):
-            self.local_path = drive
-            self.refresh_local_panel()
-            
-    def on_local_drive_manual(self, event):
-        """Handle manual path entry for local drive"""
-        path = self.local_drive_var.get().strip()
-        if path and os.path.exists(path):
-            self.local_path = path
-            self.refresh_local_panel()
-            
-    def on_remote_drive_change(self, event):
-        """Handle remote drive change"""
-        drive = self.remote_drive_var.get()
-        if drive and self.remote_client.sock:
-            if self.remote_client.change_dir(drive):
-                self.remote_path = drive
-                self.refresh_remote_panel()
-                
-    def on_remote_drive_manual(self, event):
-        """Handle manual path entry for remote drive"""
-        path = self.remote_drive_var.get().strip()
-        if path and self.remote_client.sock:
-            if self.remote_client.change_dir(path):
-                self.remote_path = path
-                self.refresh_remote_panel()
-                
-    def switch_panel(self, event):
-        """Switch between local and remote panels"""
-        if self.active_panel == 'local':
-            self.active_panel = 'remote'
-            self.remote_tree.focus_set()
+                self.remote_path += '/' + name
+            self.refresh_remote()
         else:
-            self.active_panel = 'local'
+            # Предложение скачать файл
+            if messagebox.askyesno("Скачивание", f"Скачать файл {name}?"):
+                self.download_single_file(name)
+
+    def on_local_enter_key(self, event):
+        self.on_local_double_click(None)
+        
+    def on_remote_enter_key(self, event):
+        self.on_remote_double_click(None)
+
+    def set_active_panel(self, panel):
+        self.active_panel = panel
+        color = '#ffffcc' if panel == 'local' else '#ccffcc'
+        self.local_path_label.config(bg=color if panel == 'local' else '#ffffcc')
+        self.remote_path_label.config(bg=color if panel == 'remote' else '#ffffcc')
+        
+    def switch_panel(self, event):
+        if self.active_panel == 'local':
+            self.remote_tree.focus_set()
+            self.set_active_panel('remote')
+        else:
             self.local_tree.focus_set()
+            self.set_active_panel('local')
         return 'break'
         
-    def connect_server(self):
-        """Connect to remote server"""
-        dialog = ServerConnectDialog(self.root)
-        if dialog.result:
-            host, port = dialog.result
-            try:
-                self.remote_client.host = host
-                self.remote_client.port = port
-                self.remote_client.connect()
-                
-                self.remote_server = f"{host}:{port}"
-                self.connection_label.config(text=f"Connected: {host}:{port}", fg='green')
-                
-                # Get initial directory listing
-                self.remote_path = '/'
-                self.populate_remote_drives()
-                self.refresh_remote_panel()
-                
-                self.status_bar.config(text=f"Connected to {host}:{port}")
-            except Exception as e:
-                messagebox.showerror("Connection Error", f"Failed to connect: {e}")
-                self.remote_client.disconnect()
-                
-    def disconnect_server(self):
-        """Disconnect from remote server"""
-        if self.remote_client.sock:
-            self.remote_client.disconnect()
-            self.remote_server = None
-            self.connection_label.config(text="Disconnected", fg='red')
-            self.remote_drive_combo['values'] = []
-            self.remote_drive_var.set('')
+    def on_local_drive_change(self, event):
+        drive = self.local_drive_var.get()
+        if os.path.exists(drive):
+            self.local_path = drive
+            self.refresh_local()
             
-            for item in self.remote_tree.get_children():
-                self.remote_tree.delete(item)
-                
-            self.status_bar.config(text="Disconnected")
+    def on_local_drive_enter(self, event):
+        path = self.local_drive_var.get()
+        if os.path.exists(path):
+            self.local_path = path
+            self.refresh_local()
+        else:
+            messagebox.showerror("Ошибка", "Путь не существует")
             
-    def manual_connect(self):
-        """Manual connection dialog"""
-        self.connect_server()
+    def on_remote_drive_change(self, event):
+        if not self.is_connected: return
+        drive = self.remote_drive_var.get()
+        self.remote_path = drive
+        self.refresh_remote()
         
-    def scan_servers(self):
-        """Scan network for servers"""
-        self.status_bar.config(text="Scanning network...")
+    def on_remote_drive_enter(self, event):
+        if not self.is_connected: return
+        path = self.remote_drive_var.get()
+        self.remote_path = path
+        self.refresh_remote()
+
+    # --- СЕТЕВЫЕ ОПЕРАЦИИ ---
+    
+    def toggle_connection(self):
+        if self.is_connected:
+            self.is_connected = False
+            self.udp_client.connected = False
+            self.conn_btn.config(text="Подключиться", bg='#dddddd')
+            self.status_label.config(text="Отключено", fg='red')
+            self.remote_path_label.config(text="Не подключено")
+            self.remote_tree.delete(*self.remote_tree.get_children())
+            self.status_bar.config(text="Отключено от сервера")
+        else:
+            self.connect_to_server()
+            
+    def connect_to_server(self):
+        ip = self.ip_entry.get()
+        try:
+            port = int(self.port_entry.get())
+        except ValueError:
+            messagebox.showerror("Ошибка", "Неверный номер порта")
+            return
+            
+        self.server_address = ip
+        self.server_port = port
+        self.udp_client.host = ip
+        self.udp_client.port = port
+        
+        self.status_label.config(text="Подключение...", fg='orange')
+        self.root.update()
+        
+        if self.udp_client.connect():
+            # Проверка связи
+            try:
+                self.udp_client.list_dir('/') # Тестовый запрос
+                self.is_connected = True
+                self.conn_btn.config(text="Отключиться", bg='#ffcccc')
+                self.status_label.config(text=f"Подключено: {ip}:{port}", fg='green')
+                self.remote_path = "/"
+                self.update_remote_drives()
+                self.refresh_remote()
+                self.status_bar.config(text=f"Подключено к {ip}:{port}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Сервер не ответил корректно: {e}")
+                self.is_connected = False
+                self.status_label.config(text="Ошибка", fg='red')
+        else:
+            messagebox.showerror("Ошибка", "Не удалось подключиться к серверу")
+            self.status_label.config(text="Ошибка", fg='red')
+            
+    def scan_network_gui(self):
+        self.status_bar.config(text="Сканирование сети...")
         self.root.update()
         
         def scan():
-            servers = UDPScanner.scan_network()
-            self.root.after(0, lambda: self.show_scan_results(servers))
+            servers = self.udp_client.scan_network(self.server_port)
+            self.root.after(0, lambda: self.show_scan_result(servers))
             
-        thread = threading.Thread(target=scan)
-        thread.start()
+        threading.Thread(target=scan, daemon=True).start()
         
-    def show_scan_results(self, servers):
-        """Show scan results"""
-        if servers:
-            result = '\n'.join(servers)
-            messagebox.showinfo("Servers Found", f"Found UDP servers at:\n{result}")
+    def show_scan_result(self, servers):
+        if not servers:
+            messagebox.showinfo("Поиск", "Серверы не найдены")
         else:
-            messagebox.showinfo("Scan Complete", "No servers found")
+            win = tk.Toplevel(self.root)
+            win.title("Найденные серверы")
+            win.geometry("300x200")
+            lb = tk.Listbox(win)
+            lb.pack(fill=tk.BOTH, expand=True)
+            for s in servers:
+                lb.insert(tk.END, s)
+            lb.bind('<Double-1>', lambda e: self.select_scanned_server(lb.get(lb.curselection()), win))
             
-        self.status_bar.config(text="Ready")
-        
-    def copy_file(self):
-        """Copy file between panels"""
-        if self.active_panel == 'local':
-            # Copy from local to remote
-            selection = self.local_tree.selection()
-            if not selection:
-                return
-                
-            item = selection[0]
-            name = self.local_tree.item(item, 'text')
-            ftype = self.local_tree.item(item, 'values')[1]
-            
-            if ftype == 'FILE':
-                src_path = os.path.join(self.local_path, name)
-                dst_path = os.path.join(self.remote_path, name)
-                
-                if self.remote_client.upload_file(src_path, dst_path):
-                    self.refresh_remote_panel()
-                    self.status_bar.config(text=f"Copied {name} to remote")
-                else:
-                    messagebox.showerror("Error", "Failed to upload file")
-            else:
-                messagebox.showwarning("Warning", "Directory copy not supported yet")
-                
-        else:
-            # Copy from remote to local
-            selection = self.remote_tree.selection()
-            if not selection:
-                return
-                
-            item = selection[0]
-            name = self.remote_tree.item(item, 'text')
-            ftype = self.remote_tree.item(item, 'values')[1]
-            
-            if ftype == 'FILE':
-                src_path = os.path.join(self.remote_path, name)
-                dst_path = os.path.join(self.local_path, name)
-                
-                if self.remote_client.download_file(src_path, dst_path):
-                    self.refresh_local_panel()
-                    self.status_bar.config(text=f"Copied {name} from remote")
-                else:
-                    messagebox.showerror("Error", "Failed to download file")
-            else:
-                messagebox.showwarning("Warning", "Directory copy not supported yet")
-                
-    def create_directory(self):
-        """Create new directory"""
-        name = simpledialog.askstring("New Directory", "Enter directory name:")
-        if not name:
+    def select_scanned_server(self, ip, win):
+        self.ip_entry.delete(0, tk.END)
+        self.ip_entry.insert(0, ip)
+        win.destroy()
+        self.connect_to_server()
+
+    # --- ФУНКЦИОНАЛЬНЫЕ КНОПКИ ---
+    
+    def download_selected(self):
+        """Скачивание выбранных файлов с сервера в локальную папку"""
+        if not self.is_connected:
+            messagebox.showwarning("Внимание", "Нет подключения к серверу")
             return
             
+        selection = self.remote_tree.selection()
+        if not selection:
+            messagebox.showwarning("Внимание", "Выберите файлы для скачивания")
+            return
+            
+        for item_id in selection:
+            item = self.remote_tree.item(item_id)
+            name = item['values'][0]
+            is_dir = item['tags'][0] == 'dir'
+            
+            if is_dir:
+                # Рекурсивное скачивание папок требует сложной логики, пока только предупреждение
+                messagebox.showinfo("Инфо", f"Скачивание папок ({name}) пока не поддерживается, только файлы.")
+                continue
+                
+            self.download_single_file(name)
+            
+    def download_single_file(self, filename):
+        """Скачивание одного файла"""
+        remote_full = os.path.join(self.remote_path, filename).replace('\\', '/')
+        local_full = os.path.join(self.local_path, filename)
+        
+        self.status_bar.config(text=f"Скачивание {filename}...")
+        self.root.update()
+        
+        try:
+            res = self.udp_client.send_request('GET_FILE_CONTENT', {'path': remote_full})
+            
+            if res and 'content' in res:
+                import base64
+                data = base64.b64decode(res['content'])
+                with open(local_full, 'wb') as f:
+                    f.write(data)
+                messagebox.showinfo("Успех", f"Файл {filename} скачан!")
+                self.refresh_local()
+            else:
+                messagebox.showwarning("Внимание", "Сервер не передал содержимое файла (возможно, файл слишком большой для UDP пакета).")
+                
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось скачать файл: {e}")
+        finally:
+            self.status_bar.config(text="Готово")
+
+    def copy_files(self):
+        """Копирование между панелями"""
         if self.active_panel == 'local':
-            path = os.path.join(self.local_path, name)
+            # Копирование ЛОКАЛЬНЫЙ -> УДАЛЕННЫЙ
+            if not self.is_connected:
+                messagebox.showwarning("Внимание", "Нет подключения к серверу")
+                return
+            selection = self.local_tree.selection()
+            if not selection: return
+            
+            messagebox.showinfo("Инфо", "Загрузка файлов на сервер пока не реализована в демо-режиме.")
+            
+        else:
+            # Копирование УДАЛЕННЫЙ -> ЛОКАЛЬНЫЙ (то же что Скачать)
+            self.download_selected()
+
+    def create_directory(self):
+        """Создание директории"""
+        name = simpledialog.askstring("Новая папка", "Имя папки:")
+        if not name: return
+        
+        if self.active_panel == 'local':
             try:
-                os.makedirs(path, exist_ok=True)
-                self.refresh_local_panel()
+                os.makedirs(os.path.join(self.local_path, name))
+                self.refresh_local()
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to create directory: {e}")
+                messagebox.showerror("Ошибка", str(e))
         else:
-            if self.remote_client.sock:
-                path = os.path.join(self.remote_path, name)
-                if self.remote_client.mkdir(path):
-                    self.refresh_remote_panel()
-                else:
-                    messagebox.showerror("Error", "Failed to create directory on server")
-                    
-    def delete_file(self):
-        """Delete selected file"""
-        if self.active_panel == 'local':
-            selection = self.local_tree.selection()
-            if not selection:
-                return
+            if not self.is_connected: return
+            try:
+                self.udp_client.send_request('MKDIR', {'path': os.path.join(self.remote_path, name)})
+                self.refresh_remote()
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
                 
-            item = selection[0]
-            name = self.local_tree.item(item, 'text')
-            
-            if messagebox.askyesno("Confirm Delete", f"Delete {name}?"):
-                path = os.path.join(self.local_path, name)
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                    elif os.path.isdir(path):
-                        os.rmdir(path)
-                    self.refresh_local_panel()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to delete: {e}")
-        else:
-            if self.remote_client.sock:
+    def delete_files(self):
+        """Удаление файлов"""
+        if messagebox.askyesno("Подтверждение", "Удалить выбранные файлы?"):
+            if self.active_panel == 'local':
+                selection = self.local_tree.selection()
+                for item_id in selection:
+                    name = self.local_tree.item(item_id)['values'][0]
+                    path = os.path.join(self.local_path, name)
+                    try:
+                        if os.path.isdir(path):
+                            os.rmdir(path)
+                        else:
+                            os.remove(path)
+                    except Exception as e:
+                        messagebox.showerror("Ошибка", str(e))
+                self.refresh_local()
+            else:
+                if not self.is_connected: return
                 selection = self.remote_tree.selection()
-                if not selection:
-                    return
-                    
-                item = selection[0]
-                name = self.remote_tree.item(item, 'text')
-                
-                if messagebox.askyesno("Confirm Delete", f"Delete {name} from server?"):
+                for item_id in selection:
+                    name = self.remote_tree.item(item_id)['values'][0]
                     path = os.path.join(self.remote_path, name)
-                    if self.remote_client.delete(path):
-                        self.refresh_remote_panel()
-                    else:
-                        messagebox.showerror("Error", "Failed to delete on server")
-                        
+                    try:
+                        self.udp_client.send_request('DELETE', {'path': path})
+                    except Exception as e:
+                        messagebox.showerror("Ошибка", str(e))
+                self.refresh_remote()
+
     def rename_file(self):
-        """Rename selected file"""
+        """Переименование"""
         if self.active_panel == 'local':
             selection = self.local_tree.selection()
-            if not selection:
-                return
-                
-            item = selection[0]
-            old_name = self.local_tree.item(item, 'text')
-            
-            new_name = simpledialog.askstring("Rename", "Enter new name:", initialvalue=old_name)
+            if not selection: return
+            old_name = self.local_tree.item(selection[0])['values'][0]
+            new_name = simpledialog.askstring("Переименовать", "Новое имя:", initialvalue=old_name)
             if new_name and new_name != old_name:
-                old_path = os.path.join(self.local_path, old_name)
-                new_path = os.path.join(self.local_path, new_name)
-                try:
-                    os.rename(old_path, new_path)
-                    self.refresh_local_panel()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to rename: {e}")
+                os.rename(os.path.join(self.local_path, old_name), os.path.join(self.local_path, new_name))
+                self.refresh_local()
         else:
-            if self.remote_client.sock:
-                selection = self.remote_tree.selection()
-                if not selection:
-                    return
-                    
-                item = selection[0]
-                old_name = self.remote_tree.item(item, 'text')
-                
-                new_name = simpledialog.askstring("Rename", "Enter new name:", initialvalue=old_name)
-                if new_name and new_name != old_name:
-                    old_path = os.path.join(self.remote_path, old_name)
-                    new_path = os.path.join(self.remote_path, new_name)
-                    if self.remote_client.rename(old_path, new_path):
-                        self.refresh_remote_panel()
-                    else:
-                        messagebox.showerror("Error", "Failed to rename on server")
-                        
-    def refresh_all(self):
-        """Refresh both panels"""
-        self.refresh_local_panel()
-        if self.remote_client.sock:
-            self.refresh_remote_panel()
+            if not self.is_connected: return
+            selection = self.remote_tree.selection()
+            if not selection: return
+            old_name = self.remote_tree.item(selection[0])['values'][0]
+            new_name = simpledialog.askstring("Переименовать", "Новое имя:", initialvalue=old_name)
+            if new_name and new_name != old_name:
+                self.udp_client.send_request('RENAME', {
+                    'old_path': os.path.join(self.remote_path, old_name),
+                    'new_path': os.path.join(self.remote_path, new_name)
+                })
+                self.refresh_remote()
+
+    def sort_files(self, tree, key):
+        """Сортировка колонок"""
+        items = [(tree.set(child, key), child) for child in tree.get_children('')]
+        
+        # Определение типа сортировки
+        if key == 'size':
+            def convert(val):
+                try:
+                    if 'MB' in val: return float(val.replace(' MB', '')) * 1024 * 1024
+                    if 'KB' in val: return float(val.replace(' KB', '')) * 1024
+                    if 'B' in val: return float(val.replace(' B', ''))
+                    return 0
+                except: return 0
+            items.sort(key=lambda x: convert(x[0]), reverse=self.sort_reverse)
+        elif key == 'date':
+             items.sort(key=lambda x: x[0], reverse=self.sort_reverse)
+        else:
+            items.sort(key=lambda x: x[0], reverse=self.sort_reverse)
             
-    def show_shortcuts(self):
-        """Show keyboard shortcuts"""
-        shortcuts = """
-Keyboard Shortcuts:
-------------------
-Tab          - Switch between panels
-F5           - Copy file
-F7           - Create directory
-F8           - Delete file
-F2           - Rename file
-Ctrl+R       - Refresh both panels
-Backspace    - Go up one directory
-Enter        - Open file/directory
-Double-click - Open file/directory
-"""
-        messagebox.showinfo("Keyboard Shortcuts", shortcuts)
+        for index, (val, child) in enumerate(items):
+            tree.move(child, '', index)
+        
+        self.sort_reverse = not self.sort_reverse
+        self.sort_key = key
+
+    def go_up_dir(self, event):
+        """Переход вверх на одну директорию"""
+        if self.active_panel == 'local':
+            if self.local_path != os.path.dirname(self.local_path):
+                self.local_path = os.path.dirname(self.local_path)
+                self.refresh_local()
+        else:
+            if self.is_connected and self.remote_path != '/':
+                self.remote_path = os.path.dirname(self.remote_path)
+                if self.remote_path == '': self.remote_path = '/'
+                self.refresh_remote()
+
+    def refresh_all(self):
+        self.refresh_local()
+        if self.is_connected:
+            self.refresh_remote()
+        self.status_bar.config(text="Обновлено")
         
     def show_about(self):
-        """Show about dialog"""
-        about_text = """
-UDP File Manager
-Total Commander Style
-
-A dual-panel file manager with:
-- Local file system access
-- Remote file system via UDP
-- Network server scanning
-- Full file operations
-
-Version 1.0
-"""
-        messagebox.showinfo("About", about_text)
-
-
-class ServerConnectDialog(tk.simpledialog.Dialog):
-    """Dialog for connecting to server"""
-    
-    def body(self, master):
-        tk.Label(master, text="Host:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        tk.Label(master, text="Port:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        
-        self.host_entry = tk.Entry(master, width=30)
-        self.host_entry.grid(row=0, column=1, pady=5)
-        self.host_entry.insert(0, '127.0.0.1')
-        
-        self.port_entry = tk.Entry(master, width=30)
-        self.port_entry.grid(row=1, column=1, pady=5)
-        self.port_entry.insert(0, '5000')
-        
-        return self.host_entry
-        
-    def apply(self):
-        try:
-            host = self.host_entry.get().strip()
-            port = int(self.port_entry.get().strip())
-            self.result = (host, port)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid port number")
-            self.result = None
+        messagebox.showinfo("О программе", "UDP File Manager v2.0\nСтиль Total Commander\nРаботает через UDP протокол")
 
 
 def main():
-    """Main entry point"""
-    import sys
-    
-    # Check if running as server
-    if len(sys.argv) > 1 and sys.argv[1] == '--server':
-        host = '0.0.0.0'
-        port = 5000
-        if len(sys.argv) > 2:
-            port = int(sys.argv[2])
-            
-        print(f"Starting UDP File Server on {host}:{port}")
-        print("Press Ctrl+C to stop")
-        
-        server = UDPServer(host, port)
-        try:
-            server.start()
-        except KeyboardInterrupt:
-            print("\nStopping server...")
-            server.stop()
-        return
-        
-    # Run GUI client
     root = tk.Tk()
     app = FileManagerApp(root)
     root.mainloop()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
